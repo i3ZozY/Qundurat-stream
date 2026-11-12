@@ -1,0 +1,14 @@
+{
+  "name": "qundrat-stream",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "session": "node gen-session.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "big-integer": "^1.6.52",
+    "express": "^4.19.2",
+    "input": "^1.0.1",
+    "telegram": "^2.26.0"
+  }
+}
