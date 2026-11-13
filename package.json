@@ -9,6 +9,7 @@
     "big-integer": "^1.6.52",
     "express": "^4.19.2",
     "input": "^1.0.1",
-    "telegram": "^2.26.0"
+    "telegram": "^2.26.0",
+    "@distube/ytdl-core": "^4.15.8"
   }
 }
