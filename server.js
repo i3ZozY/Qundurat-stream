@@ -256,30 +256,83 @@ async function fileById(req, res) {
 
 /* مسار يوتيوب الخاص (مشغل نظيف بدون أي أثر لليوتيوب) */
 async function youtubeStream(req, res) {
+  const videoId = req.params.id;
+  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
+    return res.status(400).send('معرف يوتيوب غير صالح');
+  }
+  const videoURL = `https://www.youtube.com/watch?v=${videoId}`;
+  if (!ytdl.validateURL(videoURL)) {
+    return res.status(400).send('رابط يوتيوب غير صحيح');
+  }
+
   try {
-    const videoId = req.params.id;
-    if (!videoId || videoId.length < 5) return res.status(400).send('معرف يوتيوب غير صالح');
-    
-    const videoURL = `https://www.youtube.com/watch?v=${videoId}`;
-    if (!ytdl.validateURL(videoURL)) return res.status(400).send('رابط يوتيوب غير صحيح');
+    /* 1) نجيب معلومات الفيديو (مع إعادة محاولة واحدة لو فشل التوقيع) */
+    let info;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        info = await ytdl.getInfo(videoURL);
+        break;
+      } catch (e) {
+        if (attempt === 2) throw e;
+        await new Promise(r => setTimeout(r, 800));
+      }
+    }
 
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
+    /* 2) نختار أعلى جودة mp4 (فيديو + صوت في نفس الملف) */
+    const candidates = info.formats
+      .filter(f => f.hasVideo && f.hasAudio && f.url)
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
 
-    const stream = ytdl(videoURL, {
-      filter: 'videoandaudio',
-      quality: 'highest'
+    let format =
+      candidates.find(f => f.container === 'mp4') ||
+      candidates[0];
+
+    if (!format) {
+      format = ytdl.chooseFormat(info.formats, { quality: 'highest', filter: 'audioandvideo' });
+    }
+    if (!format || !format.url) {
+      return res.status(404).send('لا توجد صيغة متاحة');
+    }
+
+    /* 3) نمرر Range كما هو ليوتيوب */
+    const headers = {};
+    if (req.headers.range) headers.Range = req.headers.range;
+
+    /* 4) نجيب الـ stream من يوتيوب */
+    const upstream = await fetch(format.url, {
+      headers,
+      signal: AbortSignal.timeout(30000)
     });
 
-    stream.on('error', (err) => {
-      console.error('YouTube Stream Error:', err);
-      if (!res.headersSent) res.status(500).send('خطأ في معالجة يوتيوب');
+    /* 5) نمرر رؤوس يوتيوب للعميل */
+    res.status(upstream.status);
+    ['content-type','content-length','content-range','accept-ranges'].forEach(h => {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
     });
+    if (!res.getHeader('content-type'))  res.setHeader('Content-Type', 'video/mp4');
+    if (!res.getHeader('accept-ranges')) res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
 
-    stream.pipe(res);
+    /* 6) HEAD: نرجع رؤوس فقط */
+    if (req.method === 'HEAD') {
+      upstream.body && upstream.body.cancel().catch(() => {});
+      return res.end();
+    }
+
+    /* 7) نمرر stream للعميل */
+    const { Readable } = require('stream');
+    const rs = Readable.fromWeb(upstream.body);
+    res.on('close', () => rs.destroy());
+    rs.on('error', () => res.destroy());
+    rs.pipe(res);
+
   } catch (e) {
-    console.error(e);
-    if (!res.headersSent) res.status(500).send('تعذر جلب فيديو يوتيوب');
+    console.error('YouTube Stream Error:', e.message);
+    if (!res.headersSent) {
+      res.status(502).send('تعذر جلب فيديو يوتيوب: ' + (e.message || 'خطأ غير معروف'));
+    }
   }
 }
 
