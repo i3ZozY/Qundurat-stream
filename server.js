@@ -289,44 +289,103 @@ async function youtubeStream(req, res) {
 
     if (!format) {
       format = ytdl.chooseFormat(info.formats, { quality: 'highest', filter: 'audioandvideo' });
+/* مسار يوتيوب الخاص — يمر عبر ytdl-core مع دعم Range كامل */
+async function youtubeStream(req, res) {
+  const videoId = req.params.id;
+  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
+    return res.status(400).send('معرف يوتيوب غير صالح');
+  }
+  const videoURL = `https://www.youtube.com/watch?v=${videoId}`;
+  if (!ytdl.validateURL(videoURL)) {
+    return res.status(400).send('رابط يوتيوب غير صحيح');
+  }
+
+  try {
+    /* ١) نجيب معلومات الفيديو (مع إعادة محاولة) */
+    let info;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        info = await ytdl.getInfo(videoURL);
+        break;
+      } catch (e) {
+        if (attempt === 2) throw e;
+        await new Promise(r => setTimeout(r, 800));
+      }
     }
-    if (!format || !format.url) {
+
+    /* ٢) نختار أعلى جودة mp4 (فيديو + صوت معاً) */
+    const candidates = info.formats
+      .filter(f => f.hasVideo && f.hasAudio)
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+
+    let format =
+      candidates.find(f => f.container === 'mp4') ||
+      candidates[0];
+
+    if (!format) {
+      format = ytdl.chooseFormat(info.formats, { quality: 'highest', filter: 'audioandvideo' });
+    }
+    if (!format) {
       return res.status(404).send('لا توجد صيغة متاحة');
     }
 
-    /* 3) نمرر Range كما هو ليوتيوب */
-    const headers = {};
-    if (req.headers.range) headers.Range = req.headers.range;
+    /* ٣) نستخرج حجم الملف من محتوى الصيغة */
+    const contentLength =
+      parseInt(format.contentLength || format.content_length, 10) || 0;
 
-    /* 4) نجيب الـ stream من يوتيوب */
-    const upstream = await fetch(format.url, {
-      headers,
-      signal: AbortSignal.timeout(30000)
-    });
+    /* ٤) نعالج Range (تقديم/تأخير الفيديو) */
+    const rangeHeader = req.headers.range;
+    let status = 200;
+    let start = 0;
+    let end = contentLength ? contentLength - 1 : 0;
+    let options = { format, highWaterMark: 1024 * 1024 };
 
-    /* 5) نمرر رؤوس يوتيوب للعميل */
-    res.status(upstream.status);
-    ['content-type','content-length','content-range','accept-ranges'].forEach(h => {
-      const v = upstream.headers.get(h);
-      if (v) res.setHeader(h, v);
-    });
-    if (!res.getHeader('content-type'))  res.setHeader('Content-Type', 'video/mp4');
-    if (!res.getHeader('accept-ranges')) res.setHeader('Accept-Ranges', 'bytes');
+    if (rangeHeader && contentLength) {
+      const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+      if (m) {
+        if (m[1] === '' && m[2] !== '') {
+          start = Math.max(0, contentLength - parseInt(m[2], 10));
+        } else if (m[1] !== '') {
+          start = parseInt(m[1], 10);
+          if (m[2] !== '') end = Math.min(end, parseInt(m[2], 10));
+        }
+        if (start <= end) {
+          options.range = { start, end };
+          status = 206;
+        }
+      }
+    }
+
+    /* ٥) نبث عبر ytdl.downloadFromInfo (يتعامل مع التوقيع والـ headers) */
+    const stream = ytdl.downloadFromInfo(info, options);
+
+    res.status(status);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'private, max-age=3600');
     res.setHeader('X-Content-Type-Options', 'nosniff');
 
-    /* 6) HEAD: نرجع رؤوس فقط */
+    if (status === 206 && contentLength) {
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${contentLength}`);
+      res.setHeader('Content-Length', String(end - start + 1));
+    } else if (contentLength) {
+      res.setHeader('Content-Length', String(contentLength));
+    }
+
+    /* ٦) HEAD — نرجع رؤوس فقط */
     if (req.method === 'HEAD') {
-      upstream.body && upstream.body.cancel().catch(() => {});
+      stream.destroy();
       return res.end();
     }
 
-    /* 7) نمرر stream للعميل */
-    const { Readable } = require('stream');
-    const rs = Readable.fromWeb(upstream.body);
-    res.on('close', () => rs.destroy());
-    rs.on('error', () => res.destroy());
-    rs.pipe(res);
+    /* ٧) نمرر stream للعميل */
+    stream.on('error', (err) => {
+      console.error('YouTube stream error:', err.message);
+      if (!res.headersSent) res.status(502).send('خطأ في البث');
+      else res.destroy();
+    });
+    res.on('close', () => stream.destroy());
+    stream.pipe(res);
 
   } catch (e) {
     console.error('YouTube Stream Error:', e.message);
