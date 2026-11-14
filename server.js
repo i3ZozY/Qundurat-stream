@@ -262,99 +262,82 @@ async function youtubeStream(req, res) {
   if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
     return res.status(400).send('معرف يوتيوب غير صالح');
   }
-  const videoURL = `https://www.youtube.com/watch?v=${videoId}`;
-  if (!ytdl.validateURL(videoURL)) {
-    return res.status(400).send('رابط يوتيوب غير صحيح');
-  }
+
+  // قائمة بخوادم Piped العامة (يمكنك إضافة المزيد)
+  const PIPED_INSTANCES = [
+    'https://pipedapi.kavin.rocks',
+    'https://pipedapi.leptons.xyz',
+    'https://piped-api.lunar.icu',
+    'https://pipedapi.r4fo.com'
+  ];
 
   try {
-    /* ١) نجيب معلومات الفيديو (مع إعادة محاولة لو فشل التوقيع) */
-    let info;
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    let streamUrl = null;
+    let lastError = null;
+
+    // 1. نحاول جلب رابط البث من خوادم Piped واحدة تلو الأخرى
+    for (const instance of PIPED_INSTANCES) {
       try {
-        info = await ytdl.getInfo(videoURL);
-        break;
+        const apiUrl = `${instance}/streams/${videoId}`;
+        const response = await fetch(apiUrl, { signal: AbortSignal.timeout(10000) });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        
+        // نبحث عن أعلى جودة فيديو (video + audio معًا)
+        const videoStreams = data.videoStreams
+            .filter(v => v.videoOnly === false)
+            .sort((a, b) => (parseInt(b.quality) || 0) - (parseInt(a.quality) || 0));
+        
+        if (videoStreams.length > 0) {
+          streamUrl = videoStreams[0].url;
+          break; // نجحنا
+        }
       } catch (e) {
-        if (attempt === 2) throw e;
-        await new Promise(r => setTimeout(r, 800));
+        lastError = e;
+        console.warn(`فشل خادم Piped ${instance}:`, e.message);
       }
     }
 
-    /* ٢) نختار أعلى جودة mp4 (فيديو + صوت في نفس الملف) */
-    const candidates = info.formats
-      .filter(f => f.hasVideo && f.hasAudio)
-      .sort((a, b) => (b.height || 0) - (a.height || 0));
-
-    let format =
-      candidates.find(f => f.container === 'mp4') ||
-      candidates[0];
-
-    if (!format) {
-      format = ytdl.chooseFormat(info.formats, { quality: 'highest', filter: 'audioandvideo' });
-    }
-    if (!format) {
-      return res.status(404).send('لا توجد صيغة متاحة');
+    if (!streamUrl) {
+      throw new Error('تعذر جلب رابط البث من جميع خوادم Piped. ' + (lastError ? lastError.message : ''));
     }
 
-    /* ٣) نحسب الطول والـ Range */
-    const contentLength = parseInt(format.contentLength, 10) || 0;
-    const rangeHeader = req.headers.range;
-    let status = 200;
-    let start = 0;
-    let end = contentLength ? contentLength - 1 : 0;
-    const options = { format, highWaterMark: 1024 * 1024 };
+    // 2. الآن لدينا رابط البث. نقوم ببثه عبر خادمنا (دون إعادة توجيه)
+    const range = req.headers.range;
+    const headers = {};
+    if (range) headers.Range = range;
 
-    if (rangeHeader && contentLength) {
-      const m = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
-      if (m) {
-        if (m[1] === '' && m[2] !== '') {
-          start = Math.max(0, contentLength - parseInt(m[2], 10));
-        } else if (m[1] !== '') {
-          start = parseInt(m[1], 10);
-          if (m[2] !== '') end = Math.min(end, parseInt(m[2], 10));
-        }
-        if (start <= end) {
-          options.range = { start, end };
-          status = 206;
-        }
-      }
+    const upstream = await fetch(streamUrl, { headers });
+    if (!upstream.ok && upstream.status !== 206) {
+      throw new Error(`فشل جلب الفيديو من Piped (HTTP ${upstream.status})`);
     }
 
-    /* ٤) نبث عبر ytdl (يتعامل مع التوقيع والـ headers) */
-    const ytStream = ytdl.downloadFromInfo(info, options);
-
-    res.status(status);
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Accept-Ranges', 'bytes');
+    // 3. نمرر رؤوس الاستجابة (بما فيها Content-Range لدعم التقديم)
+    res.status(upstream.status);
+    ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
+    });
+    if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'video/mp4');
+    if (!res.getHeader('accept-ranges')) res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'private, max-age=3600');
-    res.setHeader('X-Content-Type-Options', 'nosniff');
 
-    if (status === 206 && contentLength) {
-      res.setHeader('Content-Range', `bytes ${start}-${end}/${contentLength}`);
-      res.setHeader('Content-Length', String(end - start + 1));
-    } else if (contentLength) {
-      res.setHeader('Content-Length', String(contentLength));
-    }
-
-    /* ٥) HEAD — نرجع رؤوس فقط */
     if (req.method === 'HEAD') {
-      ytStream.destroy();
+      upstream.body?.cancel().catch(() => {});
       return res.end();
     }
 
-    /* ٦) نمرر stream للعميل */
-    ytStream.on('error', (err) => {
-      console.error('YouTube stream error:', err.message);
-      if (!res.headersSent) res.status(502).send('خطأ في البث');
-      else res.destroy();
-    });
-    res.on('close', () => ytStream.destroy());
-    ytStream.pipe(res);
+    // 4. نبث الفيديو للعميل (URL يبقى ثابتًا)
+    const { Readable } = require('stream');
+    const rs = Readable.fromWeb(upstream.body);
+    res.on('close', () => rs.destroy());
+    rs.on('error', () => res.destroy());
+    rs.pipe(res);
 
   } catch (e) {
-    console.error('YouTube Stream Error:', e.message);
+    console.error('YouTube Stream Error (via Piped):', e.message);
     if (!res.headersSent) {
-      res.status(502).send('تعذر جلب فيديو يوتيوب: ' + (e.message || 'خطأ غير معروف'));
+      res.status(502).send('تعذر بث فيديو يوتيوب عبر الوسيط المجاني: ' + e.message);
     }
   }
 }
