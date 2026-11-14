@@ -2,7 +2,8 @@
  * GET /v/<channel>/<messageId>   ← يبث الفيديو من تيليجرام مع دعم Range
  * GET /f/<channel>/<messageId>   ← تحميل مباشر لملف (PDF وغيره) من رسالة في تيليجرام
  * GET /fid/<file_id>             ← تحميل مباشر عبر File ID من بوت
- * GET /yt/<id>                   ← بث فيديو يوتيوب عبر Invidious (مجاني، الرابط ثابت)
+ * GET /yt/<id>                   ← بث فيديو يوتيوب عبر Piped/Invidious مع احتياطي تلقائي
+ * GET /ytdebug/<id>               ← تشخيص: أي وسيط يوتيوب يعمل
  */
 const express = require('express');
 const path = require('path');
@@ -265,72 +266,135 @@ async function fileById(req, res) {
 }
 
 /* ============================================================
-   يوتيوب — البث عبر Invidious (مجاني، الرابط ثابت)
+   يوتيوب — يجلب رابط ملف mp4 مباشر من عدة وسطاء (Piped / Invidious)
+   مع تجربة الواحد بعد الآخر وحفظ الرابط المستخرج مؤقتاً.
+
+   المتغيرات (Environment) على Render:
+     YT_BACKENDS = piped:https://pipedapi.example.com,invidious:https://inv.example.com
+     (أو الاكتفاء بالقديم PIPED_INSTANCE_URL — لازم يكون رابط الـ API وليس الواجهة)
    ============================================================ */
-async function youtubeStream(req, res) {
-  const videoId = req.params.id;
-  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
-    return res.status(400).send('معرف يوتيوب غير صالح');
+function parseBackends() {
+  const out = [];
+  const add = (type, url) => {
+    url = String(url || '').trim().replace(/\/+$/, '');
+    if (/^https?:\/\//i.test(url) && !out.some(b => b.url === url)) out.push({ type, url });
+  };
+  (process.env.YT_BACKENDS || '').split(',').forEach(x => {
+    x = x.trim(); if (!x) return;
+    const m = /^(piped|invidious):(https?:\/\/.+)$/i.exec(x);
+    if (m) add(m[1].toLowerCase(), m[2]);
+    else add(/invidious|yewtu|inv\./i.test(x) ? 'invidious' : 'piped', x);
+  });
+  if (process.env.PIPED_INSTANCE_URL) add('piped', process.env.PIPED_INSTANCE_URL);
+  /* احتياطي عام: غير مضمون، قد يتوقف أو يحجب السيرفرات في أي وقت */
+  if (!process.env.YT_NO_PUBLIC_FALLBACK) {
+    add('piped', 'https://pipedapi.kavin.rocks');
+    add('invidious', 'https://yewtu.be');
+    add('invidious', 'https://inv.nadeko.net');
   }
+  return out;
+}
+const YT_BACKENDS = parseBackends();
+const ytCache = new Map();               /* id -> { url, exp, bi } */
+const YT_TTL = 20 * 60 * 1000;
 
-  // ⚠️ ضع رابط خدمة Piped الخاصة بك هنا (الذي حصلت عليه من Render)
-  const PIPED_INSTANCE = process.env.PIPED_INSTANCE_URL || 'https://your-piped-instance.onrender.com';
+async function getJson(url) {
+  const r = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' } });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
 
+/* رابط فيديو+صوت معاً (progressive)، الأعلى جودة أولاً */
+async function resolveFrom(b, id) {
+  if (b.type === 'piped') {
+    const d = await getJson(`${b.url}/streams/${id}`);
+    if (d.error) throw new Error(String(d.message || d.error).slice(0, 80));
+    const v = (d.videoStreams || [])
+      .filter(x => x.videoOnly === false && x.url && /mp4/i.test(x.mimeType || x.format || 'mp4'))
+      .sort((x, y) => (parseInt(y.quality) || 0) - (parseInt(x.quality) || 0));
+    if (!v.length) throw new Error('no muxed stream');
+    return v[0].url;
+  }
+  const d = await getJson(`${b.url}/api/v1/videos/${id}?local=true`);
+  const v = (d.formatStreams || [])
+    .filter(x => x.url)
+    .sort((x, y) => (parseInt(y.resolution || y.qualityLabel) || 0) - (parseInt(x.resolution || x.qualityLabel) || 0));
+  if (!v.length) throw new Error('no muxed stream');
+  const u = v[0].url;
+  return /^https?:/i.test(u) ? u : b.url + u;
+}
+
+/* يجرب الوسطاء بالترتيب؛ skip = وسيط فشل بثه للتو */
+async function resolveYt(id, skipBi) {
+  const fails = [];
+  for (let i = 0; i < YT_BACKENDS.length; i++) {
+    if (i === skipBi) continue;
+    const b = YT_BACKENDS[i];
+    try {
+      const url = await resolveFrom(b, id);
+      const hit = { url, exp: Date.now() + YT_TTL, bi: i };
+      ytCache.set(id, hit);
+      return hit;
+    } catch (e) { fails.push(`${b.type}@${new URL(b.url).host}: ${e.message}`); }
+  }
+  const err = new Error(fails.join(' | ') || 'لا يوجد وسيط مضبوط');
+  err.fails = fails;
+  throw err;
+}
+
+async function openUpstream(hit, range) {
+  const headers = { 'User-Agent': 'Mozilla/5.0' };
+  if (range) headers.Range = range;
+  return fetch(hit.url, { headers, signal: AbortSignal.timeout(20000) });
+}
+
+async function youtubeStream(req, res) {
+  const id = req.params.id;
+  if (!id || !/^[\w-]{11}$/.test(id)) return res.status(400).send('معرف يوتيوب غير صالح');
+  if (!YT_BACKENDS.length) return res.status(500).send('لم يتم ضبط أي وسيط يوتيوب (YT_BACKENDS)');
   try {
-    // 1. طلب معلومات الفيديو من Piped الخاص بك
-    const apiUrl = `${PIPED_INSTANCE}/streams/${videoId}`;
-    const response = await fetch(apiUrl, { signal: AbortSignal.timeout(15000) });
-    if (!response.ok) throw new Error(`Piped API error: HTTP ${response.status}`);
-
-    const data = await response.json();
-
-    // 2. اختيار أفضل صيغة (فيديو + صوت)
-    const videoStreams = data.videoStreams
-      .filter(v => v.videoOnly === false)
-      .sort((a, b) => (parseInt(b.quality) || 0) - (parseInt(a.quality) || 0));
-
-    if (!videoStreams.length) {
-      throw new Error('لا توجد روابط بث متاحة من Piped الخاص بك');
+    let hit = ytCache.get(id);
+    if (!hit || hit.exp < Date.now()) hit = await resolveYt(id);
+    let up = null;
+    try { up = await openUpstream(hit, req.headers.range); } catch (_) { up = null; }
+    if (!up || (!up.ok && up.status !== 206 && up.status !== 416)) {
+      /* الرابط انتهى أو الوسيط معطل: جرب وسيطاً آخر مرة واحدة */
+      if (up && up.body) up.body.cancel().catch(() => {});
+      ytCache.delete(id);
+      hit = await resolveYt(id, hit.bi);
+      up = await openUpstream(hit, req.headers.range);
+      if (!up.ok && up.status !== 206) throw new Error('الوسيط رفض البث: HTTP ' + up.status);
     }
-
-    const streamUrl = videoStreams[0].url;
-
-    // 3. بث الفيديو عبر خادمك (الرابط يبقى ثابتاً)
-    const range = req.headers.range;
-    const headers = {};
-    if (range) headers.Range = range;
-
-    const upstream = await fetch(streamUrl, { headers });
-    if (!upstream.ok && upstream.status !== 206) {
-      throw new Error(`فشل جلب الفيديو من Piped: HTTP ${upstream.status}`);
-    }
-
-    res.status(upstream.status);
+    res.status(up.status);
     ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
-      const v = upstream.headers.get(h);
-      if (v) res.setHeader(h, v);
+      const v = up.headers.get(h); if (v) res.setHeader(h, v);
     });
-    if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'video/mp4');
+    if (!/^video\//i.test(res.getHeader('content-type') || '')) res.setHeader('Content-Type', 'video/mp4');
     if (!res.getHeader('accept-ranges')) res.setHeader('Accept-Ranges', 'bytes');
-
-    if (req.method === 'HEAD') {
-      upstream.body?.cancel().catch(() => {});
-      return res.end();
-    }
-
+    res.setHeader('Cache-Control', 'private, max-age=600');
+    if (req.method === 'HEAD') { up.body && up.body.cancel().catch(() => {}); return res.end(); }
     const { Readable } = require('stream');
-    const rs = Readable.fromWeb(upstream.body);
+    const rs = Readable.fromWeb(up.body);
     res.on('close', () => rs.destroy());
     rs.on('error', () => res.destroy());
     rs.pipe(res);
-
   } catch (e) {
-    console.error('YouTube Stream Error (via private Piped):', e.message);
-    if (!res.headersSent) {
-      res.status(502).send('تعذر بث فيديو يوتيوب عبر الوسيط الخاص: ' + e.message);
-    }
+    console.error('YouTube error:', e.message);
+    if (!res.headersSent) res.status(502).send('تعذر بث فيديو يوتيوب: ' + e.message);
   }
 }
+
+/* تشخيص: افتح /ytdebug/<id> لترى أي وسيط يعمل وأيها يفشل ولماذا */
+app.get('/ytdebug/:id', async (req, res) => {
+  const id = req.params.id;
+  if (!/^[\w-]{11}$/.test(id)) return res.sendStatus(400);
+  const out = [];
+  for (const b of YT_BACKENDS) {
+    try { const u = await resolveFrom(b, id); out.push(`OK   ${b.type} ${b.url}  ->  ${u.slice(0, 90)}…`); }
+    catch (e) { out.push(`FAIL ${b.type} ${b.url}  ->  ${e.message}`); }
+  }
+  res.type('text/plain').send(out.join('\n') || 'no backends');
+});
 
 app.get('/v/:channel/:msg', stream);
 app.head('/v/:channel/:msg', stream);
