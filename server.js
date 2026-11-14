@@ -1,4 +1,9 @@
-/* خدمة بث مقاطع تيليجرام ويوتيوب لموقع القندرات (مصحح وجذري) */
+/* خدمة بث مقاطع تيليجرام ويوتيوب لموقع القندرات
+ * GET /v/<channel>/<messageId>   ← يبث الفيديو من تيليجرام مع دعم Range
+ * GET /f/<channel>/<messageId>   ← تحميل مباشر لملف (PDF وغيره) من رسالة في تيليجرام
+ * GET /fid/<file_id>             ← تحميل مباشر عبر File ID من بوت
+ * (يوتيوب لا يمر من هنا: يُشغَّل في الموقع عبر iframe رسمي مخفي)
+ */
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
@@ -15,9 +20,10 @@ const ALLOWED = (process.env.ALLOWED_CHANNELS || '').split(',').map(s => s.trim(
 const ORIGINS = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
 
 if (!API_ID || !API_HASH || !SESSION) {
-  console.error('ناقص: TG_API_ID و TG_API_HASH و TG_SESSION');
+  console.error('ناقص: TG_API_ID و TG_API_HASH و TG_SESSION (شغّل gen-session.js لإنشاء الجلسة)');
   process.exit(1);
 }
+if (!ALLOWED.length) console.warn('تنبيه: ALLOWED_CHANNELS غير محدد، أي قناة عامة يمكن بثها عبر خدمتك. الأفضل تحديد القنوات.');
 
 const client = new TelegramClient(new StringSession(SESSION), API_ID, API_HASH, { connectionRetries: 10 });
 const CH = 512 * 1024;
@@ -113,6 +119,10 @@ app.get('/health', (req, res) => res.send('ok'));
 function guard(req, res, channel, msg) {
   if (!/^(c\d{4,}|[A-Za-z][A-Za-z0-9_]{3,63})$/.test(channel) || !/^\d{1,12}$/.test(msg)) { res.sendStatus(400); return false; }
   if (ALLOWED.length && !ALLOWED.includes(channel.toLowerCase())) { res.sendStatus(403); return false; }
+  if (ORIGINS.length) {
+    const ref = (req.headers.referer || req.headers.origin || '');
+    if (ref && !ORIGINS.some(o => ref.startsWith(o))) { res.sendStatus(403); return false; }
+  }
   return true;
 }
 
@@ -140,9 +150,11 @@ function parseRange(req, size) {
 
 function fail(res, e) {
   const m = String(e.errorMessage || e.message || e);
-  console.error('error:', m);
+  console.error('error:', m.replace(BOT_TOKEN || '\u0000', '***'));
   if (res.headersSent) return res.destroy();
-  res.status(502).send('تعذر المعالجة');
+  if (/FLOOD/.test(m)) return res.status(429).send('ضغط على تيليجرام، حاول بعد قليل');
+  if (/USERNAME_NOT_OCCUPIED|USERNAME_INVALID|CHANNEL_PRIVATE/.test(m)) return res.status(404).send('القناة غير متاحة');
+  res.status(502).send('تعذر جلب الملف');
 }
 
 async function stream(req, res) {
@@ -168,128 +180,102 @@ async function stream(req, res) {
   } catch (e) { fail(res, e); }
 }
 
-/* ============================================================
-   يوتيوب — البث عبر جلب الخوادم النشطة تلقائياً (ديناميكي ومضمون)
-   ============================================================ */
-async function youtubeStream(req, res) {
-  const videoId = req.params.id;
-  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
-    return res.status(400).send('معرف يوتيوب غير صالح');
-  }
+function safeName(n, fallback) {
+  n = String(n || '').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  return n || fallback;
+}
 
-  let streamUrl = null;
+function disposition(inline, name) {
+  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '');
+  return `${inline ? 'inline' : 'attachment'}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
 
+function guessPdfMime(mime, name) {
+  return mime && mime !== 'application/octet-stream' ? mime : (/\.pdf$/i.test(name) ? 'application/pdf' : 'application/octet-stream');
+}
+
+async function fileByMessage(req, res) {
+  const { channel, msg } = req.params;
+  if (!guard(req, res, channel, msg)) return;
   try {
-    // 1. جلب قائمة الخوادم النشطة والصحية من Invidious تلقائياً
-    const instancesRes = await fetch('https://api.invidious.io/instances.json?sort_by=health', {
-      signal: AbortSignal.timeout(5000)
+    const info = await loadInfo(channel, msg);
+    if (!info) return res.status(404).send('الملف غير موجود');
+    if (info.isVideo) return res.status(415).send('هذه الرسالة فيديو، استخدم مسار /v');
+    const size = info.size, r = parseRange(req, size);
+    if (!r) return res.status(416).set('Content-Range', 'bytes */' + size).end();
+    let name = safeName(req.query.n, '');
+    const orig = info.name || 'file.pdf';
+    if (name && !/\.[A-Za-z0-9]{2,5}$/.test(name)) name += (orig.match(/\.[A-Za-z0-9]{2,5}$/) || ['.pdf'])[0];
+    name = name || safeName(orig, 'file.pdf');
+    res.status(r.status).set({
+      'Content-Type': guessPdfMime(info.mime, orig),
+      'Accept-Ranges': 'bytes',
+      'Content-Length': String(r.end - r.start + 1),
+      'Content-Disposition': disposition(req.query.inline === '1', name),
+      'Cache-Control': 'private, max-age=3600',
+      'X-Content-Type-Options': 'nosniff'
     });
-    
-    if (instancesRes.ok) {
-      const instances = await instancesRes.json();
-      // التجربة على أفضل الخوادم النشطة
-      for (const [domain, details] of instances) {
-        if (details.type === 'https' && details.cors && details.api) {
-          try {
-            const apiRes = await fetch(`https://${domain}/api/v1/videos/${videoId}`, {
-              headers: { 'User-Agent': 'Mozilla/5.0' },
-              signal: AbortSignal.timeout(4000)
-            });
-            if (!apiRes.ok) continue;
-            const data = await apiRes.json();
-            
-            const format = (data.formatStreams || []).find(f => f.type && f.type.includes('video/mp4')) || data.formatStreams?.[0];
-            if (format && format.url) {
-              streamUrl = format.url;
-              break;
-            }
-          } catch (e) {
-            continue; // الانتقال للخادم التالي في حال فشل الحالي
-          }
-        }
-      }
-    }
-  } catch (err) {
-    console.error('Dynamic instances fetch failed, trying fallbacks...');
+    if (r.status === 206) res.set('Content-Range', `bytes ${r.start}-${r.end}/${size}`);
+    if (req.method === 'HEAD') return res.end();
+    await pipeRange(info, r.start, r.end, res);
+  } catch (e) { fail(res, e); }
+}
+
+const botPaths = new Map();
+
+async function fileById(req, res) {
+  if (!BOT_TOKEN) return res.status(501).send('BOT_TOKEN غير مضبوط في الخدمة');
+  const id = req.params.fileId;
+  if (!/^[A-Za-z0-9_-]{20,250}$/.test(id)) return res.sendStatus(400);
+  if (ORIGINS.length) {
+    const ref = (req.headers.referer || req.headers.origin || '');
+    if (ref && !ORIGINS.some(o => ref.startsWith(o))) return res.sendStatus(403);
   }
-
-  // 2. إذا لم تنجح الطريقة الديناميكية، نلجأ لقائمة احتياطية ثابتة وموثوقة
-  if (!streamUrl) {
-    const fallbackInstances = [
-      'https://vid.puffyan.us',
-      'https://invidious.privacyredirect.com',
-      'https://inv.nadeko.net',
-      'https://invidious.nerdworks.nl'
-    ];
-
-    for (const instance of fallbackInstances) {
-      try {
-        const apiRes = await fetch(`${instance}/api/v1/videos/${videoId}`, {
-          headers: { 'User-Agent': 'Mozilla/5.0' },
-          signal: AbortSignal.timeout(4000)
-        });
-        if (!apiRes.ok) continue;
-        const data = await apiRes.json();
-        const format = (data.formatStreams || []).find(f => f.type && f.type.includes('video/mp4')) || data.formatStreams?.[0];
-        if (format && format.url) {
-          streamUrl = format.url;
-          break;
-        }
-      } catch (e) {
-        continue;
-      }
-    }
-  }
-
-  if (!streamUrl) {
-    return res.status(502).send('تعذر جلب رابط بث يوتيوب حالياً، جميع الخوادم الوسيطة مشغولة أو محظورة من الاستضافة.');
-  }
-
   try {
-    const range = req.headers.range;
-    const headers = { 'User-Agent': 'Mozilla/5.0' };
-    if (range) headers.Range = range;
-
-    const upstream = await fetch(streamUrl, { headers });
-    if (!upstream.ok && upstream.status !== 206) {
-      return res.status(502).send('فشل الاتصال بسيرفر البث المباشر');
+    let hit = botPaths.get(id);
+    if (!hit || hit.exp < Date.now()) {
+      const j = await (await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(id)}`)).json();
+      if (!j.ok || !j.result || !j.result.file_path) return res.status(404).send('File ID غير صالح أو أن الملف أكبر من 20MB');
+      hit = { path: j.result.file_path, exp: Date.now() + 40 * 60 * 1000 };
+      botPaths.set(id, hit);
     }
-
-    res.status(upstream.status);
-    ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
-      const v = upstream.headers.get(h);
-      if (v) res.setHeader(h, v);
+    const headers = {};
+    if (req.headers.range) headers.Range = req.headers.range;
+    const up = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${hit.path}`, { headers });
+    if (!up.ok && up.status !== 206) { botPaths.delete(id); return res.status(up.status === 416 ? 416 : 502).send('تعذر جلب الملف'); }
+    const base = hit.path.split('/').pop();
+    const name = safeName(req.query.n, '')
+      ? (safeName(req.query.n, '') + (/\.[A-Za-z0-9]{2,5}$/.test(req.query.n) ? '' : (base.match(/\.[A-Za-z0-9]{2,5}$/) || ['.pdf'])[0]))
+      : safeName(base, 'file.pdf');
+    res.status(up.status).set({
+      'Content-Type': guessPdfMime('', name),
+      'Accept-Ranges': 'bytes',
+      'Content-Disposition': disposition(req.query.inline === '1', name),
+      'Cache-Control': 'private, max-age=3600',
+      'X-Content-Type-Options': 'nosniff'
     });
-    if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'video/mp4');
-    if (!res.getHeader('accept-ranges')) res.setHeader('Accept-Ranges', 'bytes');
-
-    if (req.method === 'HEAD') {
-      upstream.body?.cancel().catch(() => {});
-      return res.end();
-    }
-
+    ['content-length', 'content-range'].forEach(h => { const v = up.headers.get(h); if (v) res.set(h, v); });
+    if (req.method === 'HEAD') { up.body && up.body.cancel(); return res.end(); }
     const { Readable } = require('stream');
-    const rs = Readable.fromWeb(upstream.body);
+    const rs = Readable.fromWeb(up.body);
     res.on('close', () => rs.destroy());
     rs.on('error', () => res.destroy());
     rs.pipe(res);
-
-  } catch (e) {
-    console.error('YouTube Stream Error:', e.message);
-    if (!res.headersSent) res.status(502).send('خطأ في بث الفيديو');
-  }
+  } catch (e) { fail(res, e); }
 }
 
 app.get('/v/:channel/:msg', stream);
 app.head('/v/:channel/:msg', stream);
-app.get('/yt/:id', youtubeStream);
-app.head('/yt/:id', youtubeStream);
+app.get('/f/:channel/:msg', fileByMessage);
+app.head('/f/:channel/:msg', fileByMessage);
+app.get('/fid/:fileId', fileById);
+app.head('/fid/:fileId', fileById);
 
 const pub = path.join(__dirname, 'public');
 if (fs.existsSync(pub)) app.use(express.static(pub));
 
 (async () => {
   await client.connect();
-  console.log('متصل بتيليجرام بنجاح');
-  app.listen(PORT, () => console.log('السيرفر يعمل بكفاءة على المنفذ ' + PORT));
+  console.log('متصل بتيليجرام');
+  app.listen(PORT, () => console.log('يعمل على المنفذ ' + PORT));
 })().catch(e => { console.error(e); process.exit(1); });
