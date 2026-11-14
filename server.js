@@ -273,53 +273,36 @@ async function youtubeStream(req, res) {
     return res.status(400).send('معرف يوتيوب غير صالح');
   }
 
-  const INVIDIOUS_INSTANCES = [
-    'https://invidious.f5.si',
-    'https://yewtu.be',
-    'https://invidious.nerdvpn.de',
-    'https://inv.nadeko.net',
-    'https://invidious.privacyredirect.com',
-    'https://iv.melmac.space'
-  ];
+  // ⚠️ ضع رابط خدمة Piped الخاصة بك هنا (الذي حصلت عليه من Render)
+  const PIPED_INSTANCE = process.env.PIPED_INSTANCE_URL || 'https://your-piped-instance.onrender.com';
 
   try {
-    let streamUrl = null;
-    let lastError = null;
+    // 1. طلب معلومات الفيديو من Piped الخاص بك
+    const apiUrl = `${PIPED_INSTANCE}/streams/${videoId}`;
+    const response = await fetch(apiUrl, { signal: AbortSignal.timeout(15000) });
+    if (!response.ok) throw new Error(`Piped API error: HTTP ${response.status}`);
 
-    for (const base of INVIDIOUS_INSTANCES) {
-      try {
-        const apiUrl = `${base}/api/v1/videos/${videoId}?local=true`;
-        const response = await fetch(apiUrl, { signal: AbortSignal.timeout(12000) });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
 
-        const data = await response.json();
+    // 2. اختيار أفضل صيغة (فيديو + صوت)
+    const videoStreams = data.videoStreams
+      .filter(v => v.videoOnly === false)
+      .sort((a, b) => (parseInt(b.quality) || 0) - (parseInt(a.quality) || 0));
 
-        if (data.formatStreams && data.formatStreams.length > 0) {
-          const best = data.formatStreams[data.formatStreams.length - 1];
-          streamUrl = best.url;
-        } else if (data.adaptiveFormats && data.adaptiveFormats.length > 0) {
-          const best = data.adaptiveFormats[0];
-          streamUrl = best.url;
-        }
-
-        if (streamUrl) break;
-      } catch (e) {
-        lastError = e;
-        console.warn(`فشل Invidious (${base}):`, e.message);
-      }
+    if (!videoStreams.length) {
+      throw new Error('لا توجد روابط بث متاحة من Piped الخاص بك');
     }
 
-    if (!streamUrl) {
-      throw new Error('تعذر جلب رابط البث من جميع مثيلات Invidious. ' + (lastError ? lastError.message : ''));
-    }
+    const streamUrl = videoStreams[0].url;
 
+    // 3. بث الفيديو عبر خادمك (الرابط يبقى ثابتاً)
     const range = req.headers.range;
     const headers = {};
     if (range) headers.Range = range;
 
     const upstream = await fetch(streamUrl, { headers });
     if (!upstream.ok && upstream.status !== 206) {
-      throw new Error(`فشل جلب الفيديو من Invidious (HTTP ${upstream.status})`);
+      throw new Error(`فشل جلب الفيديو من Piped: HTTP ${upstream.status}`);
     }
 
     res.status(upstream.status);
@@ -329,10 +312,9 @@ async function youtubeStream(req, res) {
     });
     if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'video/mp4');
     if (!res.getHeader('accept-ranges')) res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'private, max-age=3600');
 
     if (req.method === 'HEAD') {
-      upstream.body && upstream.body.cancel().catch(() => {});
+      upstream.body?.cancel().catch(() => {});
       return res.end();
     }
 
@@ -343,9 +325,9 @@ async function youtubeStream(req, res) {
     rs.pipe(res);
 
   } catch (e) {
-    console.error('YouTube Stream Error (via Invidious):', e.message);
+    console.error('YouTube Stream Error (via private Piped):', e.message);
     if (!res.headersSent) {
-      res.status(502).send('تعذر بث فيديو يوتيوب عبر الوسيط المجاني: ' + e.message);
+      res.status(502).send('تعذر بث فيديو يوتيوب عبر الوسيط الخاص: ' + e.message);
     }
   }
 }
