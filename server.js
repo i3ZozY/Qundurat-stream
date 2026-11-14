@@ -296,19 +296,34 @@ async function setupYtdlp() {
     console.log('yt-dlp جاهز');
   } catch (e) { ytdlpErr = e.message; console.error('yt-dlp setup:', e.message); }
 }
-function ytdlpResolve(id) {
+function ytdlpOnce(id, extra) {
   return new Promise((resolve, reject) => {
-    if (!ytdlpReady) return reject(new Error('yt-dlp غير جاهز: ' + ytdlpErr));
-    const args = ['-g', '-f', 'b[ext=mp4][height<=720]/b[height<=720]/b', '--no-playlist', '--no-warnings', '--no-cache-dir'];
+    const args = ['-g', '-f', 'b[ext=mp4][height<=720]/b[height<=720]/b', '--no-playlist', '--no-warnings', '--no-cache-dir', ...extra];
     if (process.env.YT_COOKIES && fs.existsSync(YT_COOKIE_FILE)) args.push('--cookies', YT_COOKIE_FILE);
     args.push('https://www.youtube.com/watch?v=' + id);
     execFile(YTDLP, args, { timeout: 40000, maxBuffer: 1 << 20 }, (err, out, errOut) => {
       const url = String(out || '').split('\n').map(x => x.trim()).find(x => /^https?:\/\//.test(x));
       if (url) return resolve(url);
       const msg = String(errOut || (err && err.message) || 'فشل').split('\n').filter(Boolean).pop() || 'فشل';
-      reject(new Error(msg.replace(/^ERROR:\s*/, '').slice(0, 160)));
+      reject(new Error(msg.replace(/^ERROR:\s*/, '').slice(0, 140)));
     });
   });
+}
+/* يجرب عدة "عملاء" يوتيوب: بعضها يعمل من السيرفرات بدون كوكيز */
+async function ytdlpResolve(id) {
+  if (!ytdlpReady) throw new Error('yt-dlp غير جاهز: ' + ytdlpErr);
+  const tries = [
+    ['--extractor-args', 'youtube:player_client=android_vr'],
+    ['--extractor-args', 'youtube:player_client=tv_simply'],
+    ['--extractor-args', 'youtube:player_client=web_safari,mweb', '--js-runtimes', 'node'],
+    []
+  ];
+  const errs = [];
+  for (const t of tries) {
+    try { return await ytdlpOnce(id, t); }
+    catch (e) { errs.push((t[1] || 'default').replace('youtube:player_client=', '') + ': ' + e.message); }
+  }
+  throw new Error(errs.join(' ; '));
 }
 
 function parseBackends() {
