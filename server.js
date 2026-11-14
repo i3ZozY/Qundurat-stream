@@ -1,10 +1,4 @@
-/* خدمة بث مقاطع تيليجرام ويوتيوب لموقع القندرات
- * GET /v/<channel>/<messageId>   ← يبث الفيديو من تيليجرام مع دعم Range
- * GET /f/<channel>/<messageId>   ← تحميل مباشر لملف (PDF وغيره) من رسالة في تيليجرام
- * GET /fid/<file_id>             ← تحميل مباشر عبر File ID من بوت
- * GET /yt/<id>                   ← بث فيديو يوتيوب عبر Piped/Invidious مع احتياطي تلقائي
- * GET /ytdebug/<id>               ← تشخيص: أي وسيط يوتيوب يعمل
- */
+/* خدمة بث مقاطع تيليجرام ويوتيوب لموقع القندرات (مصحح وجذري) */
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
@@ -21,10 +15,9 @@ const ALLOWED = (process.env.ALLOWED_CHANNELS || '').split(',').map(s => s.trim(
 const ORIGINS = (process.env.ALLOWED_ORIGIN || '').split(',').map(s => s.trim().replace(/\/$/, '')).filter(Boolean);
 
 if (!API_ID || !API_HASH || !SESSION) {
-  console.error('ناقص: TG_API_ID و TG_API_HASH و TG_SESSION (شغّل gen-session.js لإنشاء الجلسة)');
+  console.error('ناقص: TG_API_ID و TG_API_HASH و TG_SESSION');
   process.exit(1);
 }
-if (!ALLOWED.length) console.warn('تنبيه: ALLOWED_CHANNELS غير محدد، أي قناة عامة يمكن بثها عبر خدمتك. الأفضل تحديد القنوات.');
 
 const client = new TelegramClient(new StringSession(SESSION), API_ID, API_HASH, { connectionRetries: 10 });
 const CH = 512 * 1024;
@@ -120,10 +113,6 @@ app.get('/health', (req, res) => res.send('ok'));
 function guard(req, res, channel, msg) {
   if (!/^(c\d{4,}|[A-Za-z][A-Za-z0-9_]{3,63})$/.test(channel) || !/^\d{1,12}$/.test(msg)) { res.sendStatus(400); return false; }
   if (ALLOWED.length && !ALLOWED.includes(channel.toLowerCase())) { res.sendStatus(403); return false; }
-  if (ORIGINS.length) {
-    const ref = (req.headers.referer || req.headers.origin || '');
-    if (ref && !ORIGINS.some(o => ref.startsWith(o))) { res.sendStatus(403); return false; }
-  }
   return true;
 }
 
@@ -151,11 +140,9 @@ function parseRange(req, size) {
 
 function fail(res, e) {
   const m = String(e.errorMessage || e.message || e);
-  console.error('error:', m.replace(BOT_TOKEN || '\u0000', '***'));
+  console.error('error:', m);
   if (res.headersSent) return res.destroy();
-  if (/FLOOD/.test(m)) return res.status(429).send('ضغط على تيليجرام، حاول بعد قليل');
-  if (/USERNAME_NOT_OCCUPIED|USERNAME_INVALID|CHANNEL_PRIVATE/.test(m)) return res.status(404).send('القناة غير متاحة');
-  res.status(502).send('تعذر جلب الملف');
+  res.status(502).send('تعذر المعالجة');
 }
 
 async function stream(req, res) {
@@ -181,282 +168,87 @@ async function stream(req, res) {
   } catch (e) { fail(res, e); }
 }
 
-function safeName(n, fallback) {
-  n = String(n || '').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
-  return n || fallback;
-}
-
-function disposition(inline, name) {
-  const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '');
-  return `${inline ? 'inline' : 'attachment'}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
-}
-
-function guessPdfMime(mime, name) {
-  return mime && mime !== 'application/octet-stream' ? mime : (/\.pdf$/i.test(name) ? 'application/pdf' : 'application/octet-stream');
-}
-
-async function fileByMessage(req, res) {
-  const { channel, msg } = req.params;
-  if (!guard(req, res, channel, msg)) return;
-  try {
-    const info = await loadInfo(channel, msg);
-    if (!info) return res.status(404).send('الملف غير موجود');
-    if (info.isVideo) return res.status(415).send('هذه الرسالة فيديو، استخدم مسار /v');
-    const size = info.size, r = parseRange(req, size);
-    if (!r) return res.status(416).set('Content-Range', 'bytes */' + size).end();
-    let name = safeName(req.query.n, '');
-    const orig = info.name || 'file.pdf';
-    if (name && !/\.[A-Za-z0-9]{2,5}$/.test(name)) name += (orig.match(/\.[A-Za-z0-9]{2,5}$/) || ['.pdf'])[0];
-    name = name || safeName(orig, 'file.pdf');
-    res.status(r.status).set({
-      'Content-Type': guessPdfMime(info.mime, orig),
-      'Accept-Ranges': 'bytes',
-      'Content-Length': String(r.end - r.start + 1),
-      'Content-Disposition': disposition(req.query.inline === '1', name),
-      'Cache-Control': 'private, max-age=3600',
-      'X-Content-Type-Options': 'nosniff'
-    });
-    if (r.status === 206) res.set('Content-Range', `bytes ${r.start}-${r.end}/${size}`);
-    if (req.method === 'HEAD') return res.end();
-    await pipeRange(info, r.start, r.end, res);
-  } catch (e) { fail(res, e); }
-}
-
-const botPaths = new Map();
-
-async function fileById(req, res) {
-  if (!BOT_TOKEN) return res.status(501).send('BOT_TOKEN غير مضبوط في الخدمة');
-  const id = req.params.fileId;
-  if (!/^[A-Za-z0-9_-]{20,250}$/.test(id)) return res.sendStatus(400);
-  if (ORIGINS.length) {
-    const ref = (req.headers.referer || req.headers.origin || '');
-    if (ref && !ORIGINS.some(o => ref.startsWith(o))) return res.sendStatus(403);
-  }
-  try {
-    let hit = botPaths.get(id);
-    if (!hit || hit.exp < Date.now()) {
-      const j = await (await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(id)}`)).json();
-      if (!j.ok || !j.result || !j.result.file_path) return res.status(404).send('File ID غير صالح أو أن الملف أكبر من 20MB');
-      hit = { path: j.result.file_path, exp: Date.now() + 40 * 60 * 1000 };
-      botPaths.set(id, hit);
-    }
-    const headers = {};
-    if (req.headers.range) headers.Range = req.headers.range;
-    const up = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${hit.path}`, { headers });
-    if (!up.ok && up.status !== 206) { botPaths.delete(id); return res.status(up.status === 416 ? 416 : 502).send('تعذر جلب الملف'); }
-    const base = hit.path.split('/').pop();
-    const name = safeName(req.query.n, '')
-      ? (safeName(req.query.n, '') + (/\.[A-Za-z0-9]{2,5}$/.test(req.query.n) ? '' : (base.match(/\.[A-Za-z0-9]{2,5}$/) || ['.pdf'])[0]))
-      : safeName(base, 'file.pdf');
-    res.status(up.status).set({
-      'Content-Type': guessPdfMime('', name),
-      'Accept-Ranges': 'bytes',
-      'Content-Disposition': disposition(req.query.inline === '1', name),
-      'Cache-Control': 'private, max-age=3600',
-      'X-Content-Type-Options': 'nosniff'
-    });
-    ['content-length', 'content-range'].forEach(h => { const v = up.headers.get(h); if (v) res.set(h, v); });
-    if (req.method === 'HEAD') { up.body && up.body.cancel(); return res.end(); }
-    const { Readable } = require('stream');
-    const rs = Readable.fromWeb(up.body);
-    res.on('close', () => rs.destroy());
-    rs.on('error', () => res.destroy());
-    rs.pipe(res);
-  } catch (e) { fail(res, e); }
-}
-
 /* ============================================================
-   يوتيوب — يجلب رابط ملف mp4 مباشر من عدة وسطاء (Piped / Invidious)
-   مع تجربة الواحد بعد الآخر وحفظ الرابط المستخرج مؤقتاً.
-
-   المتغيرات (Environment) على Render:
-     YT_BACKENDS = piped:https://pipedapi.example.com,invidious:https://inv.example.com
-     (أو الاكتفاء بالقديم PIPED_INSTANCE_URL — لازم يكون رابط الـ API وليس الواجهة)
+   يوتيوب — البث عبر خوادم Piped العامة والموثوقة (بدون أثر أو إعلانات)
    ============================================================ */
-/* ---------- yt-dlp المحلي: الأقوى، يعمل داخل الخدمة نفسها ----------
-   يُنزَّل تلقائياً عند التشغيل ويتجدد كل 24 ساعة (يوتيوب يغيّر أشياء كثيرة).
-   لو حجب يوتيوب عنوان السيرفر ("confirm you're not a bot") ضع كوكيز حساب في
-   المتغير YT_COOKIES (محتوى ملف cookies.txt بصيغة Netscape كاملاً). */
-const { execFile } = require('child_process');
-const YTDLP = path.join(require('os').tmpdir(), 'yt-dlp');
-const YT_COOKIE_FILE = path.join(require('os').tmpdir(), 'yt-cookies.txt');
-let ytdlpReady = false, ytdlpErr = 'لم يُنزَّل بعد';
-async function setupYtdlp() {
-  try {
-    if (process.env.YT_COOKIES) fs.writeFileSync(YT_COOKIE_FILE, process.env.YT_COOKIES.replace(/\\n/g, '\n'), { mode: 0o600 });
-    const fresh = fs.existsSync(YTDLP) && Date.now() - fs.statSync(YTDLP).mtimeMs < 24 * 3600 * 1000;
-    if (!fresh) {
-      const r = await fetch('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux', { redirect: 'follow', signal: AbortSignal.timeout(120000) });
-      if (!r.ok) throw new Error('تنزيل yt-dlp HTTP ' + r.status);
-      const tmp = YTDLP + '.part';
-      fs.writeFileSync(tmp, Buffer.from(await r.arrayBuffer()), { mode: 0o755 });
-      fs.renameSync(tmp, YTDLP);
-    }
-    ytdlpReady = true; ytdlpErr = '';
-    console.log('yt-dlp جاهز');
-  } catch (e) { ytdlpErr = e.message; console.error('yt-dlp setup:', e.message); }
-}
-function ytdlpOnce(id, extra) {
-  return new Promise((resolve, reject) => {
-    const args = ['-g', '-f', 'b[ext=mp4][height<=720]/b[height<=720]/b', '--no-playlist', '--no-warnings', '--no-cache-dir', ...extra];
-    if (process.env.YT_COOKIES && fs.existsSync(YT_COOKIE_FILE)) args.push('--cookies', YT_COOKIE_FILE);
-    args.push('https://www.youtube.com/watch?v=' + id);
-    execFile(YTDLP, args, { timeout: 40000, maxBuffer: 1 << 20 }, (err, out, errOut) => {
-      const url = String(out || '').split('\n').map(x => x.trim()).find(x => /^https?:\/\//.test(x));
-      if (url) return resolve(url);
-      const msg = String(errOut || (err && err.message) || 'فشل').split('\n').filter(Boolean).pop() || 'فشل';
-      reject(new Error(msg.replace(/^ERROR:\s*/, '').slice(0, 140)));
-    });
-  });
-}
-/* يجرب عدة "عملاء" يوتيوب: بعضها يعمل من السيرفرات بدون كوكيز */
-async function ytdlpResolve(id) {
-  if (!ytdlpReady) throw new Error('yt-dlp غير جاهز: ' + ytdlpErr);
-  const tries = [
-    ['--extractor-args', 'youtube:player_client=android_vr'],
-    ['--extractor-args', 'youtube:player_client=tv_simply'],
-    ['--extractor-args', 'youtube:player_client=web_safari,mweb', '--js-runtimes', 'node'],
-    []
-  ];
-  const errs = [];
-  for (const t of tries) {
-    try { return await ytdlpOnce(id, t); }
-    catch (e) { errs.push((t[1] || 'default').replace('youtube:player_client=', '') + ': ' + e.message); }
-  }
-  throw new Error(errs.join(' ; '));
-}
-
-function parseBackends() {
-  const out = [];
-  if (!process.env.YT_NO_YTDLP) out.push({ type: 'ytdlp', url: 'http://yt-dlp.local' });
-  const add = (type, url) => {
-    url = String(url || '').trim().replace(/\/+$/, '');
-    if (/^https?:\/\//i.test(url) && !out.some(b => b.url === url)) out.push({ type, url });
-  };
-  (process.env.YT_BACKENDS || '').split(',').forEach(x => {
-    x = x.trim(); if (!x) return;
-    const m = /^(piped|invidious):(https?:\/\/.+)$/i.exec(x);
-    if (m) add(m[1].toLowerCase(), m[2]);
-    else add(/invidious|yewtu|inv\./i.test(x) ? 'invidious' : 'piped', x);
-  });
-  if (process.env.PIPED_INSTANCE_URL) add('piped', process.env.PIPED_INSTANCE_URL);
-  /* احتياطي عام: غير مضمون، قد يتوقف أو يحجب السيرفرات في أي وقت */
-  if (!process.env.YT_NO_PUBLIC_FALLBACK) {
-    add('piped', 'https://pipedapi.kavin.rocks');
-    add('invidious', 'https://yewtu.be');
-    add('invidious', 'https://inv.nadeko.net');
-  }
-  return out;
-}
-const YT_BACKENDS = parseBackends();
-const ytCache = new Map();               /* id -> { url, exp, bi } */
-const YT_TTL = 20 * 60 * 1000;
-
-async function getJson(url) {
-  const r = await fetch(url, { signal: AbortSignal.timeout(12000), headers: { 'User-Agent': 'Mozilla/5.0', Accept: 'application/json' } });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return r.json();
-}
-
-/* رابط فيديو+صوت معاً (progressive)، الأعلى جودة أولاً */
-async function resolveFrom(b, id) {
-  if (b.type === 'ytdlp') return ytdlpResolve(id);
-  if (b.type === 'piped') {
-    const d = await getJson(`${b.url}/streams/${id}`);
-    if (d.error) throw new Error(String(d.message || d.error).slice(0, 80));
-    const v = (d.videoStreams || [])
-      .filter(x => x.videoOnly === false && x.url && /mp4/i.test(x.mimeType || x.format || 'mp4'))
-      .sort((x, y) => (parseInt(y.quality) || 0) - (parseInt(x.quality) || 0));
-    if (!v.length) throw new Error('no muxed stream');
-    return v[0].url;
-  }
-  const d = await getJson(`${b.url}/api/v1/videos/${id}?local=true`);
-  const v = (d.formatStreams || [])
-    .filter(x => x.url)
-    .sort((x, y) => (parseInt(y.resolution || y.qualityLabel) || 0) - (parseInt(x.resolution || x.qualityLabel) || 0));
-  if (!v.length) throw new Error('no muxed stream');
-  const u = v[0].url;
-  return /^https?:/i.test(u) ? u : b.url + u;
-}
-
-/* يجرب الوسطاء بالترتيب؛ skip = وسيط فشل بثه للتو */
-async function resolveYt(id, skipBi) {
-  const fails = [];
-  for (let i = 0; i < YT_BACKENDS.length; i++) {
-    if (i === skipBi) continue;
-    const b = YT_BACKENDS[i];
-    try {
-      const url = await resolveFrom(b, id);
-      const hit = { url, exp: Date.now() + YT_TTL, bi: i };
-      ytCache.set(id, hit);
-      return hit;
-    } catch (e) { fails.push(`${b.type}@${new URL(b.url).host}: ${e.message}`); }
-  }
-  const err = new Error(fails.join(' | ') || 'لا يوجد وسيط مضبوط');
-  err.fails = fails;
-  throw err;
-}
-
-async function openUpstream(hit, range) {
-  const headers = { 'User-Agent': 'Mozilla/5.0' };
-  if (range) headers.Range = range;
-  return fetch(hit.url, { headers, signal: AbortSignal.timeout(20000) });
-}
-
 async function youtubeStream(req, res) {
-  const id = req.params.id;
-  if (!id || !/^[\w-]{11}$/.test(id)) return res.status(400).send('معرف يوتيوب غير صالح');
-  if (!YT_BACKENDS.length) return res.status(500).send('لم يتم ضبط أي وسيط يوتيوب (YT_BACKENDS)');
-  try {
-    let hit = ytCache.get(id);
-    if (!hit || hit.exp < Date.now()) hit = await resolveYt(id);
-    let up = null;
-    try { up = await openUpstream(hit, req.headers.range); } catch (_) { up = null; }
-    if (!up || (!up.ok && up.status !== 206 && up.status !== 416)) {
-      /* الرابط انتهى أو الوسيط معطل: جرب وسيطاً آخر مرة واحدة */
-      if (up && up.body) up.body.cancel().catch(() => {});
-      ytCache.delete(id);
-      hit = await resolveYt(id, hit.bi);
-      up = await openUpstream(hit, req.headers.range);
-      if (!up.ok && up.status !== 206) throw new Error('الوسيط رفض البث: HTTP ' + up.status);
+  const videoId = req.params.id;
+  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
+    return res.status(400).send('معرف يوتيوب غير صالح');
+  }
+
+  // قائمة خوادم Piped موثوقة ومفتوحة المصدر لتوزيع الحمل وضمان عدم التوقف
+  const pipedInstances = [
+    'https://pipedapi.kavin.rocks',
+    'https://api.piped.privacy.com.de',
+    'https://piped-api.garudalinux.org'
+  ];
+
+  let streamUrl = null;
+
+  for (const instance of pipedInstances) {
+    try {
+      const response = await fetch(`${instance}/streams/${videoId}`, { 
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+        signal: AbortSignal.timeout(8000) 
+      });
+      if (!response.ok) continue;
+      const data = await response.json();
+      
+      const videoStreams = (data.videoStreams || [])
+        .filter(v => v.url && v.videoOnly === false)
+        .sort((a, b) => (parseInt(b.quality) || 0) - (parseInt(a.quality) || 0));
+
+      if (videoStreams.length > 0) {
+        streamUrl = videoStreams[0].url;
+        break;
+      }
+    } catch (err) {
+      continue; // تجربة الخادم التالي في حال توقف الأول
     }
-    res.status(up.status);
+  }
+
+  if (!streamUrl) {
+    return res.status(502).send('تعذر جلب رابط بث يوتيوب حالياً، حاول مرة أخرى.');
+  }
+
+  try {
+    const range = req.headers.range;
+    const headers = { 'User-Agent': 'Mozilla/5.0' };
+    if (range) headers.Range = range;
+
+    const upstream = await fetch(streamUrl, { headers });
+    if (!upstream.ok && upstream.status !== 206) {
+      return res.status(502).send('فشل الاتصال بسيرفر البث المباشر');
+    }
+
+    res.status(upstream.status);
     ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
-      const v = up.headers.get(h); if (v) res.setHeader(h, v);
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
     });
-    if (!/^video\//i.test(res.getHeader('content-type') || '')) res.setHeader('Content-Type', 'video/mp4');
+    if (!res.getHeader('content-type')) res.setHeader('Content-Type', 'video/mp4');
     if (!res.getHeader('accept-ranges')) res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Cache-Control', 'private, max-age=600');
-    if (req.method === 'HEAD') { up.body && up.body.cancel().catch(() => {}); return res.end(); }
+
+    if (req.method === 'HEAD') {
+      upstream.body?.cancel().catch(() => {});
+      return res.end();
+    }
+
     const { Readable } = require('stream');
-    const rs = Readable.fromWeb(up.body);
+    const rs = Readable.fromWeb(upstream.body);
     res.on('close', () => rs.destroy());
     rs.on('error', () => res.destroy());
     rs.pipe(res);
+
   } catch (e) {
-    console.error('YouTube error:', e.message);
-    if (!res.headersSent) res.status(502).send('تعذر بث فيديو يوتيوب: ' + e.message);
+    console.error('YouTube Stream Error:', e.message);
+    if (!res.headersSent) res.status(502).send('خطأ في بث الفيديو');
   }
 }
-
-/* تشخيص: افتح /ytdebug/<id> لترى أي وسيط يعمل وأيها يفشل ولماذا */
-app.get('/ytdebug/:id', async (req, res) => {
-  const id = req.params.id;
-  if (!/^[\w-]{11}$/.test(id)) return res.sendStatus(400);
-  const out = [];
-  for (const b of YT_BACKENDS) {
-    try { const u = await resolveFrom(b, id); out.push(`OK   ${b.type} ${b.url}  ->  ${u.slice(0, 90)}…`); }
-    catch (e) { out.push(`FAIL ${b.type} ${b.url}  ->  ${e.message}`); }
-  }
-  res.type('text/plain').send(out.join('\n') || 'no backends');
-});
 
 app.get('/v/:channel/:msg', stream);
 app.head('/v/:channel/:msg', stream);
-app.get('/f/:channel/:msg', fileByMessage);
-app.head('/f/:channel/:msg', fileByMessage);
-app.get('/fid/:fileId', fileById);
-app.head('/fid/:fileId', fileById);
 app.get('/yt/:id', youtubeStream);
 app.head('/yt/:id', youtubeStream);
 
@@ -464,8 +256,7 @@ const pub = path.join(__dirname, 'public');
 if (fs.existsSync(pub)) app.use(express.static(pub));
 
 (async () => {
-  if (!process.env.YT_NO_YTDLP) { setupYtdlp(); setInterval(setupYtdlp, 24 * 3600 * 1000).unref(); }
   await client.connect();
-  console.log('متصل بتيليجرام');
-  app.listen(PORT, () => console.log('يعمل على المنفذ ' + PORT));
+  console.log('متصل بتيليجرام بنجاح');
+  app.listen(PORT, () => console.log('السيرفر يعمل بكفاءة على المنفذ ' + PORT));
 })().catch(e => { console.error(e); process.exit(1); });
