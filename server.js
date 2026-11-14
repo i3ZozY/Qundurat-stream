@@ -169,7 +169,7 @@ async function stream(req, res) {
 }
 
 /* ============================================================
-   يوتيوب — البث عبر خوادم Piped العامة والموثوقة (بدون أثر أو إعلانات)
+   يوتيوب — البث عبر جلب الخوادم النشطة تلقائياً (ديناميكي ومضمون)
    ============================================================ */
 async function youtubeStream(req, res) {
   const videoId = req.params.id;
@@ -177,39 +177,72 @@ async function youtubeStream(req, res) {
     return res.status(400).send('معرف يوتيوب غير صالح');
   }
 
-  // قائمة خوادم Piped موثوقة ومفتوحة المصدر لتوزيع الحمل وضمان عدم التوقف
-  const pipedInstances = [
-    'https://pipedapi.kavin.rocks',
-    'https://api.piped.privacy.com.de',
-    'https://piped-api.garudalinux.org'
-  ];
-
   let streamUrl = null;
 
-  for (const instance of pipedInstances) {
-    try {
-      const response = await fetch(`${instance}/streams/${videoId}`, { 
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        signal: AbortSignal.timeout(8000) 
-      });
-      if (!response.ok) continue;
-      const data = await response.json();
-      
-      const videoStreams = (data.videoStreams || [])
-        .filter(v => v.url && v.videoOnly === false)
-        .sort((a, b) => (parseInt(b.quality) || 0) - (parseInt(a.quality) || 0));
-
-      if (videoStreams.length > 0) {
-        streamUrl = videoStreams[0].url;
-        break;
+  try {
+    // 1. جلب قائمة الخوادم النشطة والصحية من Invidious تلقائياً
+    const instancesRes = await fetch('https://api.invidious.io/instances.json?sort_by=health', {
+      signal: AbortSignal.timeout(5000)
+    });
+    
+    if (instancesRes.ok) {
+      const instances = await instancesRes.json();
+      // التجربة على أفضل الخوادم النشطة
+      for (const [domain, details] of instances) {
+        if (details.type === 'https' && details.cors && details.api) {
+          try {
+            const apiRes = await fetch(`https://${domain}/api/v1/videos/${videoId}`, {
+              headers: { 'User-Agent': 'Mozilla/5.0' },
+              signal: AbortSignal.timeout(4000)
+            });
+            if (!apiRes.ok) continue;
+            const data = await apiRes.json();
+            
+            const format = (data.formatStreams || []).find(f => f.type && f.type.includes('video/mp4')) || data.formatStreams?.[0];
+            if (format && format.url) {
+              streamUrl = format.url;
+              break;
+            }
+          } catch (e) {
+            continue; // الانتقال للخادم التالي في حال فشل الحالي
+          }
+        }
       }
-    } catch (err) {
-      continue; // تجربة الخادم التالي في حال توقف الأول
+    }
+  } catch (err) {
+    console.error('Dynamic instances fetch failed, trying fallbacks...');
+  }
+
+  // 2. إذا لم تنجح الطريقة الديناميكية، نلجأ لقائمة احتياطية ثابتة وموثوقة
+  if (!streamUrl) {
+    const fallbackInstances = [
+      'https://vid.puffyan.us',
+      'https://invidious.privacyredirect.com',
+      'https://inv.nadeko.net',
+      'https://invidious.nerdworks.nl'
+    ];
+
+    for (const instance of fallbackInstances) {
+      try {
+        const apiRes = await fetch(`${instance}/api/v1/videos/${videoId}`, {
+          headers: { 'User-Agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(4000)
+        });
+        if (!apiRes.ok) continue;
+        const data = await apiRes.json();
+        const format = (data.formatStreams || []).find(f => f.type && f.type.includes('video/mp4')) || data.formatStreams?.[0];
+        if (format && format.url) {
+          streamUrl = format.url;
+          break;
+        }
+      } catch (e) {
+        continue;
+      }
     }
   }
 
   if (!streamUrl) {
-    return res.status(502).send('تعذر جلب رابط بث يوتيوب حالياً، حاول مرة أخرى.');
+    return res.status(502).send('تعذر جلب رابط بث يوتيوب حالياً، جميع الخوادم الوسيطة مشغولة أو محظورة من الاستضافة.');
   }
 
   try {
