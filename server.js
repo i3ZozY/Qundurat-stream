@@ -273,8 +273,47 @@ async function fileById(req, res) {
      YT_BACKENDS = piped:https://pipedapi.example.com,invidious:https://inv.example.com
      (أو الاكتفاء بالقديم PIPED_INSTANCE_URL — لازم يكون رابط الـ API وليس الواجهة)
    ============================================================ */
+/* ---------- yt-dlp المحلي: الأقوى، يعمل داخل الخدمة نفسها ----------
+   يُنزَّل تلقائياً عند التشغيل ويتجدد كل 24 ساعة (يوتيوب يغيّر أشياء كثيرة).
+   لو حجب يوتيوب عنوان السيرفر ("confirm you're not a bot") ضع كوكيز حساب في
+   المتغير YT_COOKIES (محتوى ملف cookies.txt بصيغة Netscape كاملاً). */
+const { execFile } = require('child_process');
+const YTDLP = path.join(require('os').tmpdir(), 'yt-dlp');
+const YT_COOKIE_FILE = path.join(require('os').tmpdir(), 'yt-cookies.txt');
+let ytdlpReady = false, ytdlpErr = 'لم يُنزَّل بعد';
+async function setupYtdlp() {
+  try {
+    if (process.env.YT_COOKIES) fs.writeFileSync(YT_COOKIE_FILE, process.env.YT_COOKIES.replace(/\\n/g, '\n'), { mode: 0o600 });
+    const fresh = fs.existsSync(YTDLP) && Date.now() - fs.statSync(YTDLP).mtimeMs < 24 * 3600 * 1000;
+    if (!fresh) {
+      const r = await fetch('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux', { redirect: 'follow', signal: AbortSignal.timeout(120000) });
+      if (!r.ok) throw new Error('تنزيل yt-dlp HTTP ' + r.status);
+      const tmp = YTDLP + '.part';
+      fs.writeFileSync(tmp, Buffer.from(await r.arrayBuffer()), { mode: 0o755 });
+      fs.renameSync(tmp, YTDLP);
+    }
+    ytdlpReady = true; ytdlpErr = '';
+    console.log('yt-dlp جاهز');
+  } catch (e) { ytdlpErr = e.message; console.error('yt-dlp setup:', e.message); }
+}
+function ytdlpResolve(id) {
+  return new Promise((resolve, reject) => {
+    if (!ytdlpReady) return reject(new Error('yt-dlp غير جاهز: ' + ytdlpErr));
+    const args = ['-g', '-f', 'b[ext=mp4][height<=720]/b[height<=720]/b', '--no-playlist', '--no-warnings', '--no-cache-dir'];
+    if (process.env.YT_COOKIES && fs.existsSync(YT_COOKIE_FILE)) args.push('--cookies', YT_COOKIE_FILE);
+    args.push('https://www.youtube.com/watch?v=' + id);
+    execFile(YTDLP, args, { timeout: 40000, maxBuffer: 1 << 20 }, (err, out, errOut) => {
+      const url = String(out || '').split('\n').map(x => x.trim()).find(x => /^https?:\/\//.test(x));
+      if (url) return resolve(url);
+      const msg = String(errOut || (err && err.message) || 'فشل').split('\n').filter(Boolean).pop() || 'فشل';
+      reject(new Error(msg.replace(/^ERROR:\s*/, '').slice(0, 160)));
+    });
+  });
+}
+
 function parseBackends() {
   const out = [];
+  if (!process.env.YT_NO_YTDLP) out.push({ type: 'ytdlp', url: 'http://yt-dlp.local' });
   const add = (type, url) => {
     url = String(url || '').trim().replace(/\/+$/, '');
     if (/^https?:\/\//i.test(url) && !out.some(b => b.url === url)) out.push({ type, url });
@@ -306,6 +345,7 @@ async function getJson(url) {
 
 /* رابط فيديو+صوت معاً (progressive)، الأعلى جودة أولاً */
 async function resolveFrom(b, id) {
+  if (b.type === 'ytdlp') return ytdlpResolve(id);
   if (b.type === 'piped') {
     const d = await getJson(`${b.url}/streams/${id}`);
     if (d.error) throw new Error(String(d.message || d.error).slice(0, 80));
@@ -409,6 +449,7 @@ const pub = path.join(__dirname, 'public');
 if (fs.existsSync(pub)) app.use(express.static(pub));
 
 (async () => {
+  if (!process.env.YT_NO_YTDLP) { setupYtdlp(); setInterval(setupYtdlp, 24 * 3600 * 1000).unref(); }
   await client.connect();
   console.log('متصل بتيليجرام');
   app.listen(PORT, () => console.log('يعمل على المنفذ ' + PORT));
