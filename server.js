@@ -2,7 +2,7 @@
  * GET /v/<channel>/<messageId>   ← يبث الفيديو من تيليجرام مع دعم Range
  * GET /f/<channel>/<messageId>   ← تحميل مباشر لملف (PDF وغيره) من رسالة في تيليجرام
  * GET /fid/<file_id>             ← تحميل مباشر عبر File ID من بوت
- * GET /yt/<id>                   ← بث فيديو يوتيوب كمشغل نظيف بدون أي أثر لليوتيوب
+ * GET /yt/<id>                   ← بث فيديو يوتيوب عبر Invidious (مجاني، الرابط ثابت)
  */
 const express = require('express');
 const path = require('path');
@@ -10,7 +10,6 @@ const fs = require('fs');
 const bigInt = require('big-integer');
 const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
-const ytdl = require('@distube/ytdl-core');
 
 const API_ID = parseInt(process.env.TG_API_ID, 10);
 const API_HASH = process.env.TG_API_HASH;
@@ -27,9 +26,9 @@ if (!API_ID || !API_HASH || !SESSION) {
 if (!ALLOWED.length) console.warn('تنبيه: ALLOWED_CHANNELS غير محدد، أي قناة عامة يمكن بثها عبر خدمتك. الأفضل تحديد القنوات.');
 
 const client = new TelegramClient(new StringSession(SESSION), API_ID, API_HASH, { connectionRetries: 10 });
-const CH = 512 * 1024;                       /* حجم الطلب من تيليجرام */
-const entities = new Map();                  /* channel -> entity */
-const infos = new Map();                     /* channel/msg -> {doc,size,mime,exp} */
+const CH = 512 * 1024;
+const entities = new Map();
+const infos = new Map();
 let dialogsLoaded = false;
 
 async function getEntity(channel) {
@@ -185,11 +184,15 @@ function safeName(n, fallback) {
   n = String(n || '').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
   return n || fallback;
 }
+
 function disposition(inline, name) {
   const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/"/g, '');
   return `${inline ? 'inline' : 'attachment'}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 }
-function guessPdfMime(mime, name) { return mime && mime !== 'application/octet-stream' ? mime : (/\.pdf$/i.test(name) ? 'application/pdf' : 'application/octet-stream'); }
+
+function guessPdfMime(mime, name) {
+  return mime && mime !== 'application/octet-stream' ? mime : (/\.pdf$/i.test(name) ? 'application/pdf' : 'application/octet-stream');
+}
 
 async function fileByMessage(req, res) {
   const { channel, msg } = req.params;
@@ -219,11 +222,15 @@ async function fileByMessage(req, res) {
 }
 
 const botPaths = new Map();
+
 async function fileById(req, res) {
   if (!BOT_TOKEN) return res.status(501).send('BOT_TOKEN غير مضبوط في الخدمة');
   const id = req.params.fileId;
   if (!/^[A-Za-z0-9_-]{20,250}$/.test(id)) return res.sendStatus(400);
-  if (ORIGINS.length) { const ref = (req.headers.referer || req.headers.origin || ''); if (ref && !ORIGINS.some(o => ref.startsWith(o))) return res.sendStatus(403); }
+  if (ORIGINS.length) {
+    const ref = (req.headers.referer || req.headers.origin || '');
+    if (ref && !ORIGINS.some(o => ref.startsWith(o))) return res.sendStatus(403);
+  }
   try {
     let hit = botPaths.get(id);
     if (!hit || hit.exp < Date.now()) {
@@ -232,11 +239,14 @@ async function fileById(req, res) {
       hit = { path: j.result.file_path, exp: Date.now() + 40 * 60 * 1000 };
       botPaths.set(id, hit);
     }
-    const headers = {}; if (req.headers.range) headers.Range = req.headers.range;
+    const headers = {};
+    if (req.headers.range) headers.Range = req.headers.range;
     const up = await fetch(`https://api.telegram.org/file/bot${BOT_TOKEN}/${hit.path}`, { headers });
     if (!up.ok && up.status !== 206) { botPaths.delete(id); return res.status(up.status === 416 ? 416 : 502).send('تعذر جلب الملف'); }
     const base = hit.path.split('/').pop();
-    const name = safeName(req.query.n, '') ? (safeName(req.query.n, '') + (/\.[A-Za-z0-9]{2,5}$/.test(req.query.n) ? '' : (base.match(/\.[A-Za-z0-9]{2,5}$/) || ['.pdf'])[0])) : safeName(base, 'file.pdf');
+    const name = safeName(req.query.n, '')
+      ? (safeName(req.query.n, '') + (/\.[A-Za-z0-9]{2,5}$/.test(req.query.n) ? '' : (base.match(/\.[A-Za-z0-9]{2,5}$/) || ['.pdf'])[0]))
+      : safeName(base, 'file.pdf');
     res.status(up.status).set({
       'Content-Type': guessPdfMime('', name),
       'Accept-Ranges': 'bytes',
@@ -255,7 +265,7 @@ async function fileById(req, res) {
 }
 
 /* ============================================================
-   يوتيوب — البث عبر ytdl.downloadFromInfo (يدعم Range كاملاً)
+   يوتيوب — البث عبر Invidious (مجاني، الرابط ثابت)
    ============================================================ */
 async function youtubeStream(req, res) {
   const videoId = req.params.id;
@@ -263,31 +273,13 @@ async function youtubeStream(req, res) {
     return res.status(400).send('معرف يوتيوب غير صالح');
   }
 
-  // قائمة بخوادم Piped العامة (يمكنك إضافة المزيد)
-  const PIPED_INSTANCES = [
-    'https://pipedapi.kavin.rocks',
-    'https://pipedapi.leptons.xyz',
-    'https://piped-api.lunar.icu',
-    'https://pipedapi.r4fo.com'
-  ];
-
-  try {
-    let streamUrl = null;
-    let lastError = null;
-
-    // 1. نحاول جلب رابط البث من خوادم Piped واحدة تلو الأخرى
-async function youtubeStream(req, res) {
-  const videoId = req.params.id;
-  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
-    return res.status(400).send('معرف يوتيوب غير صالح');
-  }
-
-  // قائمة بمثيلات Invidious التي تدعم local=true (محدثة حسب المصادر)
   const INVIDIOUS_INSTANCES = [
     'https://invidious.f5.si',
     'https://yewtu.be',
     'https://invidious.nerdvpn.de',
-    'https://inv.nadeko.net'
+    'https://inv.nadeko.net',
+    'https://invidious.privacyredirect.com',
+    'https://iv.melmac.space'
   ];
 
   try {
@@ -296,24 +288,20 @@ async function youtubeStream(req, res) {
 
     for (const base of INVIDIOUS_INSTANCES) {
       try {
-        // استخدام local=true لجعل Invidious يبث الفيديو عبر نفسه
         const apiUrl = `${base}/api/v1/videos/${videoId}?local=true`;
         const response = await fetch(apiUrl, { signal: AbortSignal.timeout(12000) });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        
+
         const data = await response.json();
-        
-        // نبحث عن صيغة muxed (فيديو + صوت) بأعلى جودة متاحة
+
         if (data.formatStreams && data.formatStreams.length > 0) {
-          // نختار آخر صيغة (عادة أعلى جودة muxed)
           const best = data.formatStreams[data.formatStreams.length - 1];
           streamUrl = best.url;
         } else if (data.adaptiveFormats && data.adaptiveFormats.length > 0) {
-          // احتياطي: نأخذ أعلى جودة صوت أو فيديو (قد لا تكون مدمجة)
           const best = data.adaptiveFormats[0];
           streamUrl = best.url;
         }
-        
+
         if (streamUrl) break;
       } catch (e) {
         lastError = e;
@@ -325,7 +313,6 @@ async function youtubeStream(req, res) {
       throw new Error('تعذر جلب رابط البث من جميع مثيلات Invidious. ' + (lastError ? lastError.message : ''));
     }
 
-    // الآن نبث الفيديو عبر خادمنا (الرابط يبقى ثابتاً)
     const range = req.headers.range;
     const headers = {};
     if (range) headers.Range = range;
@@ -335,7 +322,6 @@ async function youtubeStream(req, res) {
       throw new Error(`فشل جلب الفيديو من Invidious (HTTP ${upstream.status})`);
     }
 
-    // نمرر رؤوس الاستجابة (بما فيها Content-Range لدعم التقديم)
     res.status(upstream.status);
     ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
       const v = upstream.headers.get(h);
@@ -346,11 +332,10 @@ async function youtubeStream(req, res) {
     res.setHeader('Cache-Control', 'private, max-age=3600');
 
     if (req.method === 'HEAD') {
-      upstream.body?.cancel().catch(() => {});
+      upstream.body && upstream.body.cancel().catch(() => {});
       return res.end();
     }
 
-    // نبث الفيديو للعميل (URL يبقى ثابتاً)
     const { Readable } = require('stream');
     const rs = Readable.fromWeb(upstream.body);
     res.on('close', () => rs.destroy());
