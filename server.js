@@ -276,43 +276,66 @@ async function youtubeStream(req, res) {
     let lastError = null;
 
     // 1. نحاول جلب رابط البث من خوادم Piped واحدة تلو الأخرى
-    for (const instance of PIPED_INSTANCES) {
+async function youtubeStream(req, res) {
+  const videoId = req.params.id;
+  if (!videoId || !/^[\w-]{11}$/.test(videoId)) {
+    return res.status(400).send('معرف يوتيوب غير صالح');
+  }
+
+  // قائمة بمثيلات Invidious التي تدعم local=true (محدثة حسب المصادر)
+  const INVIDIOUS_INSTANCES = [
+    'https://invidious.f5.si',
+    'https://yewtu.be',
+    'https://invidious.nerdvpn.de',
+    'https://inv.nadeko.net'
+  ];
+
+  try {
+    let streamUrl = null;
+    let lastError = null;
+
+    for (const base of INVIDIOUS_INSTANCES) {
       try {
-        const apiUrl = `${instance}/streams/${videoId}`;
-        const response = await fetch(apiUrl, { signal: AbortSignal.timeout(10000) });
+        // استخدام local=true لجعل Invidious يبث الفيديو عبر نفسه
+        const apiUrl = `${base}/api/v1/videos/${videoId}?local=true`;
+        const response = await fetch(apiUrl, { signal: AbortSignal.timeout(12000) });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        
         const data = await response.json();
         
-        // نبحث عن أعلى جودة فيديو (video + audio معًا)
-        const videoStreams = data.videoStreams
-            .filter(v => v.videoOnly === false)
-            .sort((a, b) => (parseInt(b.quality) || 0) - (parseInt(a.quality) || 0));
-        
-        if (videoStreams.length > 0) {
-          streamUrl = videoStreams[0].url;
-          break; // نجحنا
+        // نبحث عن صيغة muxed (فيديو + صوت) بأعلى جودة متاحة
+        if (data.formatStreams && data.formatStreams.length > 0) {
+          // نختار آخر صيغة (عادة أعلى جودة muxed)
+          const best = data.formatStreams[data.formatStreams.length - 1];
+          streamUrl = best.url;
+        } else if (data.adaptiveFormats && data.adaptiveFormats.length > 0) {
+          // احتياطي: نأخذ أعلى جودة صوت أو فيديو (قد لا تكون مدمجة)
+          const best = data.adaptiveFormats[0];
+          streamUrl = best.url;
         }
+        
+        if (streamUrl) break;
       } catch (e) {
         lastError = e;
-        console.warn(`فشل خادم Piped ${instance}:`, e.message);
+        console.warn(`فشل Invidious (${base}):`, e.message);
       }
     }
 
     if (!streamUrl) {
-      throw new Error('تعذر جلب رابط البث من جميع خوادم Piped. ' + (lastError ? lastError.message : ''));
+      throw new Error('تعذر جلب رابط البث من جميع مثيلات Invidious. ' + (lastError ? lastError.message : ''));
     }
 
-    // 2. الآن لدينا رابط البث. نقوم ببثه عبر خادمنا (دون إعادة توجيه)
+    // الآن نبث الفيديو عبر خادمنا (الرابط يبقى ثابتاً)
     const range = req.headers.range;
     const headers = {};
     if (range) headers.Range = range;
 
     const upstream = await fetch(streamUrl, { headers });
     if (!upstream.ok && upstream.status !== 206) {
-      throw new Error(`فشل جلب الفيديو من Piped (HTTP ${upstream.status})`);
+      throw new Error(`فشل جلب الفيديو من Invidious (HTTP ${upstream.status})`);
     }
 
-    // 3. نمرر رؤوس الاستجابة (بما فيها Content-Range لدعم التقديم)
+    // نمرر رؤوس الاستجابة (بما فيها Content-Range لدعم التقديم)
     res.status(upstream.status);
     ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach(h => {
       const v = upstream.headers.get(h);
@@ -327,7 +350,7 @@ async function youtubeStream(req, res) {
       return res.end();
     }
 
-    // 4. نبث الفيديو للعميل (URL يبقى ثابتًا)
+    // نبث الفيديو للعميل (URL يبقى ثابتاً)
     const { Readable } = require('stream');
     const rs = Readable.fromWeb(upstream.body);
     res.on('close', () => rs.destroy());
@@ -335,7 +358,7 @@ async function youtubeStream(req, res) {
     rs.pipe(res);
 
   } catch (e) {
-    console.error('YouTube Stream Error (via Piped):', e.message);
+    console.error('YouTube Stream Error (via Invidious):', e.message);
     if (!res.headersSent) {
       res.status(502).send('تعذر بث فيديو يوتيوب عبر الوسيط المجاني: ' + e.message);
     }
